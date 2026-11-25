@@ -20,9 +20,21 @@ export default function App() {
     setCode(next);
   };
 
-  return code ? (
-    <Room key={code} code={code} onLeave={() => navigate(null)} />
-  ) : (
-    <Dashboard onEnter={navigate} />
+  return (
+    <div className="app-shell">
+      <div className="app-content">
+        {code ? (
+          <Room key={code} code={code} onLeave={() => navigate(null)} />
+        ) : (
+          <Dashboard onEnter={navigate} />
+        )}
+      </div>
+      <footer className="site-footer">
+        <span>© {new Date().getFullYear()} Made with &lt;3 by</span>{" "}
+        <a href="https://rb-dev.vercel.app/" target="_blank" rel="noreferrer">
+          chamborgir
+        </a>
+      </footer>
+    </div>
   );
 }
