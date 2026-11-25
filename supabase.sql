@@ -5,8 +5,13 @@
 create table if not exists rooms (
   code text primary key,
   name text not null,
+  is_private boolean not null default false,
+  pin text,
   created_at timestamptz default now()
 );
+
+alter table rooms add column if not exists is_private boolean not null default false;
+alter table rooms add column if not exists pin text;
 
 create table if not exists videos (
   id uuid primary key default gen_random_uuid(),

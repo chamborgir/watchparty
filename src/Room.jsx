@@ -15,6 +15,8 @@ const rateLabel = (r) => (r === 1 ? "Normal" : `${r}x`);
 export default function Room({ code, onLeave }) {
     const [room, setRoom] = useState(null);
     const [state, setState] = useState("loading");
+    const [pin, setPin] = useState("");
+    const [pinError, setPinError] = useState("");
 
     useEffect(() => {
         let alive = true;
@@ -31,7 +33,7 @@ export default function Room({ code, onLeave }) {
                 }
                 setRoom(data);
                 pushRecent(data);
-                setState("ready");
+                setState(data.is_private ? "locked" : "ready");
             });
         return () => {
             alive = false;
@@ -39,7 +41,39 @@ export default function Room({ code, onLeave }) {
     }, [code]);
 
     if (state === "loading")
-        return <div className="center muted">Loading room</div>;
+        return (
+            <main
+                className="room-skeleton"
+                role="status"
+                aria-label="Loading room"
+            >
+                <span className="sr-only">Loading room...</span>
+                <header className="room-skeleton-head" aria-hidden="true">
+                    <span className="skeleton skeleton-title" />
+                    <span className="skeleton skeleton-button" />
+                </header>
+                <div className="room-skeleton-main" aria-hidden="true">
+                    <section>
+                        <span className="skeleton skeleton-stage" />
+                        <span className="skeleton skeleton-text skeleton-text-wide" />
+                        <span className="skeleton skeleton-text skeleton-text-short" />
+                        <div className="room-skeleton-chips">
+                            <span className="skeleton skeleton-chip" />
+                            <span className="skeleton skeleton-chip" />
+                            <span className="skeleton skeleton-chip" />
+                        </div>
+                    </section>
+                    <aside className="room-skeleton-library">
+                        <span className="skeleton skeleton-library-title" />
+                        <span className="skeleton skeleton-library-row" />
+                        <span className="skeleton skeleton-library-row" />
+                        <span className="skeleton skeleton-library-row" />
+                        <span className="skeleton skeleton-library-title skeleton-library-subtitle" />
+                        <span className="skeleton skeleton-library-row" />
+                    </aside>
+                </div>
+            </main>
+        );
 
     if (state === "missing")
         return (
@@ -54,6 +88,46 @@ export default function Room({ code, onLeave }) {
             </div>
         );
 
+    if (state === "locked")
+        return (
+            <form
+                className="center room-pin-gate"
+                onSubmit={(event) => {
+                    event.preventDefault();
+                    if (pin === room.pin) {
+                        setPinError("");
+                        setState("ready");
+                    } else {
+                        setPinError("That PIN is incorrect. Try again.");
+                    }
+                }}
+            >
+                <h2>Private room</h2>
+                <p className="muted">Enter the 4-digit PIN to join.</p>
+                <div className="field">
+                    <label htmlFor="entry-pin">Room PIN</label>
+                    <input
+                        id="entry-pin"
+                        type="text"
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                        maxLength={4}
+                        pattern="[0-9]{4}"
+                        value={pin}
+                        required
+                        onChange={(event) =>
+                            setPin(event.target.value.replace(/\D/g, ""))
+                        }
+                    />
+                </div>
+                {pinError && <p className="error">{pinError}</p>}
+                <button className="btn primary">Enter room</button>
+                <button className="btn" type="button" onClick={onLeave}>
+                    Back to dashboard
+                </button>
+            </form>
+        );
+
     return <RoomView room={room} onLeave={onLeave} />;
 }
 
@@ -63,11 +137,12 @@ function RoomView({ room, onLeave }) {
     const videoRef = useRef(null);
     const channelRef = useRef(null);
     const handlerRef = useRef(() => {});
+    const roomMenuRef = useRef(null);
 
     // shared playback state lives in refs so event handlers always see fresh values
     const intentPlaying = useRef(false); // what the room wants: playing or paused
     const localBuffering = useRef(false);
-    const bufferingPeers = useRef(new Set());
+    const bufferingPeers = useRef(new Map());
     const suppressUntil = useRef(0); // ignore native events caused by our own code
     const pending = useRef(null); // { time } applied once metadata loads
     const currentRef = useRef(null);
@@ -84,6 +159,7 @@ function RoomView({ room, onLeave }) {
     const [needsTap, setNeedsTap] = useState(false);
     const [copied, setCopied] = useState(false);
     const [deleting, setDeleting] = useState(false);
+    const [notice, setNotice] = useState(null);
 
     currentRef.current = current;
 
@@ -94,6 +170,20 @@ function RoomView({ room, onLeave }) {
             event: "cmd",
             payload: { ...payload, from: CLIENT_ID },
         });
+    const sendBuffer = (on) =>
+        send({ type: "buffer", on, name: getName() || "Guest" });
+    const showNotice = (title, message, leave = false, onConfirm = null) =>
+        setNotice({ title, message, leave, onConfirm });
+    const closeNotice = () => {
+        const leave = notice?.leave;
+        setNotice(null);
+        if (leave) onLeave();
+    };
+    const confirmNotice = () => {
+        const onConfirm = notice?.onConfirm;
+        setNotice(null);
+        onConfirm?.();
+    };
 
     const quiet = () => (suppressUntil.current = Date.now() + 400);
     const isQuiet = () => Date.now() < suppressUntil.current;
@@ -101,26 +191,29 @@ function RoomView({ room, onLeave }) {
     // Make the real <video> match "room intent and nobody is buffering"
     const reconcile = () => {
         const v = videoRef.current;
-        if (!v) return;
         const waiting =
             localBuffering.current || bufferingPeers.current.size > 0;
-        const shouldPlay = intentPlaying.current && !waiting;
 
+        if (localBuffering.current) {
+            setStatus("Loading video...");
+        } else if (bufferingPeers.current.size > 0) {
+            const names = [...new Set(bufferingPeers.current.values())];
+            setStatus(
+                names.length === 1
+                    ? `${names[0]} is loading the video...`
+                    : `${names.join(", ")} are loading the video...`,
+            );
+        } else {
+            setStatus("");
+        }
+
+        if (!v) return;
+        const shouldPlay = intentPlaying.current && !waiting;
         if (shouldPlay && v.paused) {
             v.play().catch(() => setNeedsTap(true)); // browser blocked autoplay
         } else if (!shouldPlay && !v.paused) {
             quiet();
             v.pause();
-        }
-
-        if (intentPlaying.current && waiting) {
-            setStatus(
-                localBuffering.current
-                    ? "Loading"
-                    : "Waiting for others to load",
-            );
-        } else {
-            setStatus("");
         }
     };
 
@@ -156,7 +249,8 @@ function RoomView({ room, onLeave }) {
         setPlayError("");
         setSrc("");
         setCurrent(video);
-        send({ type: "buffer", on: true });
+        setStatus("Loading video...");
+        sendBuffer(true);
 
         // the bucket is private, so each person asks the server for their own temporary link
         signView(video.key)
@@ -166,13 +260,16 @@ function RoomView({ room, onLeave }) {
             .catch((err) => {
                 setPlayError(err.message);
                 localBuffering.current = false;
-                send({ type: "buffer", on: false });
+                sendBuffer(false);
             });
     };
 
     const clearCurrent = () => {
         intentPlaying.current = false;
+        if (localBuffering.current) sendBuffer(false);
         localBuffering.current = false;
+        bufferingPeers.current.clear();
+        setStatus("");
         setSrc("");
         setCurrent(null);
     };
@@ -215,7 +312,14 @@ function RoomView({ room, onLeave }) {
                 break;
 
             case "buffer":
-                if (msg.on) bufferingPeers.current.add(msg.from);
+                if (msg.on)
+                    bufferingPeers.current.set(
+                        msg.from,
+                        msg.name ||
+                            people.find((person) => person.key === msg.from)
+                                ?.name ||
+                            "A watcher",
+                    );
                 else bufferingPeers.current.delete(msg.from);
                 reconcile();
                 break;
@@ -228,19 +332,26 @@ function RoomView({ room, onLeave }) {
 
             case "room-deleted":
                 removeRecent(ROOM);
-                alert("This room was deleted.");
-                onLeave();
+                showNotice(
+                    "Room deleted",
+                    "This room was deleted by another watcher.",
+                    true,
+                );
                 break;
 
             case "sync-request":
                 // someone joined: tell them what we are watching, where we are, and how fast
                 if (currentRef.current && v) {
+                    const buffering = [...bufferingPeers.current.entries()];
+                    if (localBuffering.current)
+                        buffering.push([CLIENT_ID, getName() || "Guest"]);
                     send({
                         type: "sync-state",
                         video: currentRef.current,
                         time: v.currentTime,
                         playing: intentPlaying.current,
                         rate: rateRef.current,
+                        buffering,
                     });
                 }
                 break;
@@ -250,6 +361,11 @@ function RoomView({ room, onLeave }) {
                     if (msg.rate) applyRate(msg.rate);
                     startVideo(msg.video, msg.time, msg.playing);
                 }
+                for (const [key, name] of msg.buffering || []) {
+                    if (key !== CLIENT_ID)
+                        bufferingPeers.current.set(key, name);
+                }
+                reconcile();
                 break;
 
             default:
@@ -336,14 +452,14 @@ function RoomView({ room, onLeave }) {
     const onWaiting = () => {
         if (localBuffering.current) return;
         localBuffering.current = true;
-        send({ type: "buffer", on: true });
+        sendBuffer(true);
         reconcile();
     };
 
     const onReady = () => {
         if (!localBuffering.current) return;
         localBuffering.current = false;
-        send({ type: "buffer", on: false });
+        sendBuffer(false);
         reconcile();
     };
 
@@ -368,7 +484,7 @@ function RoomView({ room, onLeave }) {
         // stop everyone from waiting on a video that can never load
         if (localBuffering.current) {
             localBuffering.current = false;
-            send({ type: "buffer", on: false });
+            sendBuffer(false);
         }
         setPlayError(reasons[code] || "Could not play this video.");
     };
@@ -403,14 +519,22 @@ function RoomView({ room, onLeave }) {
             await loadVideos();
             send({ type: "videos-changed" });
         } catch (err) {
-            alert("Upload failed: " + err.message);
+            showNotice("Upload failed", err.message);
         } finally {
             setUpload(null);
         }
     };
 
-    const removeVideo = async (video) => {
-        if (!window.confirm(`Remove "${video.name}" from this room?`)) return;
+    const removeVideo = (video) => {
+        showNotice(
+            "Remove video?",
+            `Remove "${video.name}" from this room?`,
+            false,
+            () => performRemoveVideo(video),
+        );
+    };
+
+    const performRemoveVideo = async (video) => {
         try {
             await removeObject(video.key);
             await supabase.from("videos").delete().eq("id", video.id);
@@ -418,17 +542,21 @@ function RoomView({ room, onLeave }) {
             await loadVideos();
             send({ type: "videos-changed", removedId: video.id });
         } catch (err) {
-            alert("Could not remove video: " + err.message);
+            showNotice("Could not remove video", err.message);
         }
     };
 
-    const deleteRoom = async () => {
-        if (
-            !window.confirm(
-                `Delete "${room.name}" for everyone? Its videos are removed for good.`,
-            )
-        )
-            return;
+    const deleteRoom = () => {
+        if (roomMenuRef.current) roomMenuRef.current.open = false;
+        showNotice(
+            "Delete room?",
+            `Delete "${room.name}" for everyone? Its videos are removed for good.`,
+            false,
+            performDeleteRoom,
+        );
+    };
+
+    const performDeleteRoom = async () => {
         setDeleting(true);
         try {
             const { data: vids, error: vErr } = await supabase
@@ -460,13 +588,17 @@ function RoomView({ room, onLeave }) {
 
             await send({ type: "room-deleted" }); // tell everyone else in the room
             removeRecent(ROOM);
-            if (failed)
-                alert(
+            if (failed) {
+                showNotice(
+                    "Room deleted",
                     `The room is deleted, but ${failed} video file(s) could not be removed from storage.`,
+                    true,
                 );
-            onLeave();
+            } else {
+                onLeave();
+            }
         } catch (err) {
-            alert("Could not delete the room: " + err.message);
+            showNotice("Could not delete the room", err.message);
             setDeleting(false);
         }
     };
@@ -475,6 +607,7 @@ function RoomView({ room, onLeave }) {
         const link = `${window.location.origin}${window.location.pathname}?room=${ROOM}`;
         await navigator.clipboard.writeText(link);
         setCopied(true);
+        if (roomMenuRef.current) roomMenuRef.current.open = false;
         setTimeout(() => setCopied(false), 1500);
     };
 
@@ -486,29 +619,59 @@ function RoomView({ room, onLeave }) {
     return (
         <div className="room">
             <header className="room-head">
-                <div className="room-title">
-                    <button className="link" onClick={onLeave}>
-                        Dashboard
-                    </button>
-                    <strong>{room.name}</strong>
-                    <span className="code-pill">{ROOM}</span>
-                </div>
-                <div className="room-actions">
-                    <span className="muted">
-                        {people.length}{" "}
-                        {people.length === 1 ? "person" : "people"} here
-                    </span>
-                    <button className="btn small" onClick={copyLink}>
-                        {copied ? "Link copied" : "Copy invite link"}
-                    </button>
-                    <button
-                        className="btn small danger"
-                        onClick={deleteRoom}
-                        disabled={deleting}
-                    >
-                        {deleting ? "Deleting" : "Delete room"}
-                    </button>
-                </div>
+                <nav className="room-navbar" aria-label="Room navigation">
+                    <div className="room-title">
+                        <button className="link" onClick={onLeave}>
+                            Dashboard
+                        </button>
+                        <strong>{room.name}</strong>
+                        <span className="code-pill">{ROOM}</span>
+                    </div>
+                    <div className="room-actions">
+                        <span className="muted">
+                            {people.length}{" "}
+                            {people.length === 1 ? "person" : "people"} here
+                        </span>
+                        <button className="btn small" onClick={copyLink}>
+                            {copied ? "Link copied" : "Copy invite link"}
+                        </button>
+                        <button
+                            className="btn small danger"
+                            onClick={deleteRoom}
+                            disabled={deleting}
+                        >
+                            {deleting ? "Deleting" : "Delete room"}
+                        </button>
+                        <details className="room-menu" ref={roomMenuRef}>
+                            <summary aria-label="Room options">
+                                <span aria-hidden="true">•••</span>
+                            </summary>
+                            <div className="room-menu-popover">
+                                {room.is_private && (
+                                    <p className="room-menu-pin">
+                                        <span>Room PIN</span>
+                                        <strong>{room.pin}</strong>
+                                    </p>
+                                )}
+                                <button
+                                    className="btn small"
+                                    onClick={copyLink}
+                                >
+                                    {copied
+                                        ? "Link copied"
+                                        : "Copy invite link"}
+                                </button>
+                                <button
+                                    className="btn small danger"
+                                    onClick={deleteRoom}
+                                    disabled={deleting}
+                                >
+                                    {deleting ? "Deleting" : "Delete room"}
+                                </button>
+                            </div>
+                        </details>
+                    </div>
+                </nav>
             </header>
 
             <main className="room-main">
@@ -535,10 +698,12 @@ function RoomView({ room, onLeave }) {
                                         onError={onVideoError}
                                     />
                                 )}
-                                {!src && !playError && (
-                                    <div className="overlay">Loading</div>
+                                {!src && !status && !playError && (
+                                    <div className="overlay">
+                                        Loading video...
+                                    </div>
                                 )}
-                                {src && status && !playError && (
+                                {status && !playError && (
                                     <div className="overlay">{status}</div>
                                 )}
                                 {playError && (
@@ -568,7 +733,30 @@ function RoomView({ room, onLeave }) {
                         )}
                     </div>
                     {current && (
-                        <p className="now muted">Now playing, {current.name}</p>
+                        <div className="now-row">
+                            <p className="now muted">
+                                Now playing, {current.name}
+                            </p>
+                            <details className="mobile-speed-menu">
+                                <summary>Speed: {rateLabel(rate)}</summary>
+                                <div
+                                    className="mobile-speed-options"
+                                    role="group"
+                                    aria-label="Playback speed for everyone"
+                                >
+                                    {RATES.map((r) => (
+                                        <button
+                                            key={r}
+                                            className={`chip ${rate === r ? "on" : ""}`}
+                                            aria-pressed={rate === r}
+                                            onClick={() => changeRate(r)}
+                                        >
+                                            {rateLabel(r)}
+                                        </button>
+                                    ))}
+                                </div>
+                            </details>
+                        </div>
                     )}
 
                     <div className="speed">
@@ -662,6 +850,47 @@ function RoomView({ room, onLeave }) {
                     </ul>
                 </aside>
             </main>
+            {notice && (
+                <div className="notice-backdrop">
+                    <section
+                        className="notice-dialog"
+                        role="alertdialog"
+                        aria-modal="true"
+                        aria-labelledby="notice-title"
+                        aria-describedby="notice-message"
+                    >
+                        <h2 id="notice-title">{notice.title}</h2>
+                        <p id="notice-message">{notice.message}</p>
+                        <div className="notice-actions">
+                            {notice.onConfirm ? (
+                                <>
+                                    <button
+                                        className="btn notice-cancel"
+                                        autoFocus
+                                        onClick={() => setNotice(null)}
+                                    >
+                                        Cancel
+                                    </button>
+                                    <button
+                                        className="btn danger"
+                                        onClick={confirmNotice}
+                                    >
+                                        Delete
+                                    </button>
+                                </>
+                            ) : (
+                                <button
+                                    className="btn primary"
+                                    autoFocus
+                                    onClick={closeNotice}
+                                >
+                                    {notice.leave ? "Back to dashboard" : "OK"}
+                                </button>
+                            )}
+                        </div>
+                    </section>
+                </div>
+            )}
         </div>
     );
 }
